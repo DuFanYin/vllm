@@ -29,7 +29,7 @@ but at 32 and 64 rows they lose to vLLM's decode, so a served step is capped at 
 ## Enabling
 
 ```bash
-VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ROCM_USE_AITER_FP4BMM=1 vllm serve <Kimi-K3> -tp 8 \
+VLLM_ROCM_USE_AITER_FP4BMM=1 vllm serve <Kimi-K3> -tp 8 \
   [--decode-context-parallel-size 8 --dcp-comm-backend a2a] --kv-cache-dtype fp8 \
   --speculative-config '{"method": "dspark", "num_speculative_tokens": 7, ...}' \
   --additional-config '{"decode_backend": "latency_specialized"}'
@@ -40,8 +40,8 @@ There are no other options. `decode_backend=auto` (the default) runs vLLM's deco
 ## Supported deployments
 
 TP8 on MI355X with all 256 CUs, decode context parallel 1 or 8, speculative
-decoding with at most 15 speculative tokens, Model Runner V2, BF16 conv / FP32
-recurrent KDA states. M1 assumes no KV cache interleave (it writes the slots vLLM
+decoding with at most 15 speculative tokens, BF16 conv / FP32 recurrent KDA
+states. M1 assumes no KV cache interleave (it writes the slots vLLM
 maps), but at DCP8 vLLM's AITER MLA backend serves DSpark at interleave 1 only.
 
 M1 also needs an fp8 KV cache and MLA's W_UK / W_UV as AITER MXFP4 bmms
@@ -60,8 +60,7 @@ If you request the specialized decode for anything else, startup fails with one
   routed-expert capture, sleep mode, CPU weight offload, weight updates,
   no speculative decoding,
   adaptive verification, dynamic speculative decoding, ReplaySSM / RecoverSSM,
-  the V1 model runner, `STOCK_TORCH_COMPILE`, another model's shapes, another
-  GPU.
+  `STOCK_TORCH_COMPILE`, another model's shapes, another GPU.
 - **Loaded weights, when the model state builds the executor:** each kernel
   layer's weight shapes and dtypes and the MoE backend (`AITER_MXFP4_BF16`, K3
   SiTU). Each MLA layer's shapes, gate, DCP setup, fp8 cache and bmm weights
