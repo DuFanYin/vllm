@@ -1,19 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import pytest
-
 from ..utils import run_acceptance_length_eval
 
 
-@pytest.mark.parametrize("use_mrv2", [False, True])
-def test_gemma4_mtp_acceptance_lengths(
-    monkeypatch: pytest.MonkeyPatch,
-    use_mrv2: bool,
-    vllm_runner,
-):
+def test_gemma4_mtp_acceptance_lengths(vllm_runner):
     run_acceptance_length_eval(
-        monkeypatch,
         vllm_runner,
         spec_config={
             "model": "google/gemma-4-E4B-it",
@@ -34,5 +26,4 @@ def test_gemma4_mtp_acceptance_lengths(
             "gsm8k": 2.67 * 0.975,
         },
         chat_template_kwargs={},
-        use_mrv2=use_mrv2,
     )

@@ -847,27 +847,21 @@ def test_segmented_dcp_verify_matches_causal_attention(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "num_heads,spec_method,parallel_drafting,group_cache_dtype,needs_row_map",
+    "num_heads,spec_method,group_cache_dtype,needs_row_map",
     [
         *[
-            (num_heads, method, parallel, None, True)
+            (num_heads, method, None, True)
             for num_heads in [8, 16, 24, 32, 64, 128]
-            for method, parallel in [
-                ("deepseek_mtp", False),
-                # Parallel drafting needs qlen=1+2*num_spec, regardless of name.
-                ("custom", True),
-                ("eagle", False),
-            ]
+            for method in ["deepseek_mtp", "eagle"]
         ],
-        pytest.param(16, "deepseek_mtp", False, "auto", False, id="bf16-group"),
-        pytest.param(16, "deepseek_mtp", False, "fp8_e5m2", False, id="e5m2-group"),
+        pytest.param(16, "deepseek_mtp", "auto", False, id="bf16-group"),
+        pytest.param(16, "deepseek_mtp", "fp8_e5m2", False, id="e5m2-group"),
     ],
 )
 def test_builder_init_sizes_decode_metadata_and_filters_dcp_maps(
     monkeypatch,
     num_heads,
     spec_method,
-    parallel_drafting,
     group_cache_dtype,
     needs_row_map,
 ):
@@ -916,9 +910,7 @@ def test_builder_init_sizes_decode_metadata_and_filters_dcp_maps(
         # metadata is sized from the routing threshold, so a stub that skips it
         # would size for qlen=1 and hide the very mismatch this test covers.
         spec = config.speculative_config
-        self.reorder_batch_threshold = (
-            1 + (2 if spec.parallel_drafting else 1) * spec.num_speculative_tokens
-        )
+        self.reorder_batch_threshold = 1 + spec.num_speculative_tokens
 
     monkeypatch.setitem(
         sys.modules,
@@ -940,7 +932,6 @@ def test_builder_init_sizes_decode_metadata_and_filters_dcp_maps(
         speculative_config=SimpleNamespace(
             method=spec_method,
             num_speculative_tokens=3,
-            parallel_drafting=parallel_drafting,
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=8,
@@ -1075,7 +1066,7 @@ def test_builder_sizes_metadata_for_every_decode_qlen(monkeypatch):
 
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
-            method="deepseek_mtp", num_speculative_tokens=7, parallel_drafting=False
+            method="deepseek_mtp", num_speculative_tokens=7
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=4,
@@ -1585,13 +1576,11 @@ def _adaptive_config(
         speculative_config=SimpleNamespace(
             num_speculative_tokens=num_speculative_tokens,
             enable_adaptive_verification=adaptive,
-            parallel_drafting=False,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=dcp,
             cp_kv_cache_interleave_size=cp_interleave,
         ),
-        use_v2_model_runner=True,
     )
 
 

@@ -5406,11 +5406,9 @@ steps:
   - vllm/v1/sample/
   - vllm/model_executor/layers/
   - tests/v1/e2e/spec_decode/
-  - tests/spec_decode/
   - vllm/platforms/rocm.py
   commands:
   - pytest -v -s v1/e2e/spec_decode/ngram_suffix/
-  - python3 spec_decode/test_custom_proposer.py
 
 - label: ":amd: (MI355 DPX) V1 Core"
   timeout_in_minutes: 60
@@ -5926,7 +5924,7 @@ steps:
 
 - label: ":amd: (MI355 DPX) Spec Decode AL MTP + Other Acceptance Nightly"
   timeout_in_minutes: 55
-  parallelism: 3
+  parallelism: 2
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
   dind: false
   agent_pool: mi355_dpx
@@ -5956,11 +5954,9 @@ steps:
     if [ "$$BUILDKITE_PARALLEL_JOB" = "0" ]; then
     pytest -v -s
     v1/e2e/spec_decode/acceptance_rates/mtp_other/
-    --deselect "tests/v1/e2e/spec_decode/acceptance_rates/mtp_other/test_mtp.py::test_gemma4_mtp_acceptance_lengths[False]"
-    --deselect "tests/v1/e2e/spec_decode/acceptance_rates/mtp_other/test_mtp.py::test_gemma4_mtp_acceptance_lengths[True]";
+    --deselect "tests/v1/e2e/spec_decode/acceptance_rates/mtp_other/test_mtp.py::test_gemma4_mtp_acceptance_lengths";
     fi
-  - if [ "$$BUILDKITE_PARALLEL_JOB" = "1" ]; then pytest -v -s "v1/e2e/spec_decode/acceptance_rates/mtp_other/test_mtp.py::test_gemma4_mtp_acceptance_lengths[False]"; fi
-  - if [ "$$BUILDKITE_PARALLEL_JOB" = "2" ]; then pytest -v -s "v1/e2e/spec_decode/acceptance_rates/mtp_other/test_mtp.py::test_gemma4_mtp_acceptance_lengths[True]"; fi
+  - if [ "$$BUILDKITE_PARALLEL_JOB" = "1" ]; then pytest -v -s "v1/e2e/spec_decode/acceptance_rates/mtp_other/test_mtp.py::test_gemma4_mtp_acceptance_lengths"; fi
 
 - label: ":amd: (MI355 DPX) V1 E2E Hybrid Chunked Prefill" # TBD
   timeout_in_minutes: 35

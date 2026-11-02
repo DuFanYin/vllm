@@ -1770,7 +1770,6 @@ def test_dsv4_adaptive_mla_swa_metadata_graph_replay(monkeypatch) -> None:
     )
     vllm_config.speculative_config = SimpleNamespace(
         num_speculative_tokens=upper_query_len - 1,
-        parallel_drafting=False,
         enable_adaptive_verification=True,
         use_dspark=lambda: True,
     )
@@ -2019,7 +2018,6 @@ def test_dsv41_adaptive_mla_swa_metadata_graph_replay(monkeypatch) -> None:
     )
     vllm_config.speculative_config = SimpleNamespace(
         num_speculative_tokens=upper_query_len - 1,
-        parallel_drafting=False,
         enable_adaptive_verification=True,
         use_dspark=lambda: True,
     )

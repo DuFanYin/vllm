@@ -298,9 +298,7 @@ def _make_vllm_config(heads_per_rank: int):
     # qlen-QLEN row is classified as a PREFILL, so the decode path under test is
     # never reached. _init_reorder_batch_threshold reads exactly these two
     # fields, so a stand-in is enough and avoids pulling in a draft model.
-    vllm_config.speculative_config = SimpleNamespace(
-        num_speculative_tokens=QLEN - 1, parallel_drafting=False
-    )
+    vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=QLEN - 1)
     vllm_config.cache_config.cache_dtype = "fp8"
     vllm_config.parallel_config.decode_context_parallel_size = DCP
     vllm_config.parallel_config.cp_kv_cache_interleave_size = 1

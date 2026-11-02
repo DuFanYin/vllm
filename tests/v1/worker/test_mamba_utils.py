@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -22,18 +23,16 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.mamba_utils import (
-    MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
+    _get_mamba_spec_for_layer,
     _reinterpret_u64_as_i64,
     batch_memcpy,
-    collect_mamba_copy_meta,
-    do_mamba_copy_block,
+    get_mamba_group_ids,
     get_mamba_groups,
-    preprocess_mamba,
-    stage_postprocess_inputs_to_gpu,
 )
 
 # Conv + temporal copy specs, in the order the tests' MambaSpec shapes expect.
@@ -46,6 +45,101 @@ _COPY_FUNCS: MambaStateCopyFuncsByType = {
     MambaAttentionBackendEnum.GDN_ATTN: _DEFAULT_COPY_FUNCS,
     MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
 }
+
+
+@dataclass
+class MambaCopyBuffers:
+    """Staging buffers for the CPU reference copy path below."""
+
+    src_ptrs: CpuGpuBuffer
+    dst_ptrs: CpuGpuBuffer
+    sizes: CpuGpuBuffer
+    mamba_group_ids: list[int]
+    mamba_spec: MambaSpec
+    offset: int = 0
+
+    @classmethod
+    def create(
+        cls,
+        max_num_reqs: int,
+        kv_cache_config: KVCacheConfig,
+        copy_funcs: MambaStateCopyFuncsByType,
+        make_buffer: Callable[..., Any],
+    ) -> "MambaCopyBuffers":
+        mamba_groups = get_mamba_groups(kv_cache_config)
+        mamba_spec = next(iter(mamba_groups))
+        mamba_group_ids = get_mamba_group_ids(mamba_groups)
+        entries_per_req = sum(
+            len(
+                copy_funcs[
+                    _get_mamba_spec_for_layer(
+                        kv_cache_config.kv_cache_groups[gid], layer_name
+                    ).mamba_type
+                ]
+            )
+            for gid in mamba_group_ids
+            for layer_name in kv_cache_config.kv_cache_groups[gid].layer_names
+        )
+        n = max_num_reqs * entries_per_req
+        return cls(
+            src_ptrs=make_buffer(n, dtype=torch.uint64),
+            dst_ptrs=make_buffer(n, dtype=torch.uint64),
+            sizes=make_buffer(n, dtype=torch.int32),
+            mamba_group_ids=mamba_group_ids,
+            mamba_spec=mamba_spec,
+        )
+
+
+def collect_mamba_copy_meta(
+    copy_bufs: MambaCopyBuffers,
+    kv_cache_config: KVCacheConfig,
+    mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+    mamba_group_ids: list[int],
+    src_block_idx: int,
+    dest_block_idx: int,
+    accept_token_bias: int,
+    req_state: Any,
+    forward_context: dict[str, Any],
+) -> None:
+    """CPU reference: queue the state copies for one request."""
+    if src_block_idx == dest_block_idx and accept_token_bias == 0:
+        return
+
+    src_ptrs_np = copy_bufs.src_ptrs.np
+    dst_ptrs_np = copy_bufs.dst_ptrs.np
+    sizes_np = copy_bufs.sizes.np
+    offset = copy_bufs.offset
+
+    for mamba_group_id in mamba_group_ids:
+        block_ids = req_state.block_ids[mamba_group_id]
+        dest_block_id = block_ids[dest_block_idx]
+        kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
+        for layer_name in kv_cache_group.layer_names:
+            mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, layer_name)
+            state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
+            kv_caches: list[torch.Tensor] = forward_context[layer_name].kv_cache
+            for state, state_copy_func in zip(kv_caches, state_copy_funcs):
+                copy_spec = state_copy_func(
+                    state, block_ids, src_block_idx, accept_token_bias + 1
+                )
+                src_ptrs_np[offset] = copy_spec.start_addr
+                dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
+                sizes_np[offset] = copy_spec.num_elements * state.element_size()
+                offset += 1
+
+    copy_bufs.offset = offset
+
+
+def do_mamba_copy_block(copy_bufs: MambaCopyBuffers) -> None:
+    """CPU reference: run the queued state copies."""
+    n = copy_bufs.offset
+    if n == 0:
+        return
+    batch_memcpy(
+        copy_bufs.src_ptrs.copy_to_gpu(n),
+        copy_bufs.dst_ptrs.copy_to_gpu(n),
+        copy_bufs.sizes.copy_to_gpu(n),
+    )
 
 
 def postprocess_mamba(
@@ -102,68 +196,6 @@ def postprocess_mamba(
             if src_block_idx == dest_block_idx:
                 num_accepted_tokens_cpu[i] = 1
     do_mamba_copy_block(copy_bufs)
-
-
-def _make_scheduler_output(
-    finished_req_ids: set[str],
-    preempted_req_ids: set[str] | None,
-    resumed_req_ids: set[str],
-) -> SchedulerOutput:
-    cached = CachedRequestData.make_empty()
-    cached.resumed_req_ids = resumed_req_ids
-    return SchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=cached,
-        num_scheduled_tokens={},
-        total_num_scheduled_tokens=0,
-        scheduled_spec_decode_tokens={},
-        scheduled_encoder_inputs={},
-        finished_req_ids=finished_req_ids,
-        free_encoder_mm_hashes=[],
-        preempted_req_ids=preempted_req_ids,
-    )
-
-
-def test_resumed_req_ids_cleared_from_mamba_state_idx():
-    """When a request is force-preempted (e.g. reset_prefix_cache),
-    it appears in resumed_req_ids but NOT in preempted_req_ids.
-    preprocess_mamba must still clear its mamba_state_idx entry,
-    otherwise stale indices can point beyond the new block allocation.
-    """
-    spec = MagicMock(block_size=64, num_speculative_blocks=0)
-    cache_config = MagicMock(enable_prefix_caching=True)
-    input_batch = MagicMock(req_ids=[])
-    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
-
-    mamba_state_idx: dict[str, int] = {
-        "finished": 1,
-        "preempted": 2,
-        "resumed": 3,  # only in resumed_req_ids, NOT in preempted
-        "keep": 99,
-    }
-    sched = _make_scheduler_output(
-        finished_req_ids={"finished"},
-        preempted_req_ids={"preempted"},
-        resumed_req_ids={"resumed"},
-    )
-
-    with patch(
-        "vllm.v1.worker.mamba_utils.get_mamba_groups",
-        return_value=([0], spec),
-    ):
-        preprocess_mamba(
-            sched,
-            MagicMock(),  # kv_cache_config
-            cache_config,
-            mamba_state_idx,
-            input_batch,
-            {},  # requests
-            {},  # forward_context
-            {},  # mamba_state_copy_funcs
-            copy_bufs,
-        )
-
-    assert mamba_state_idx == {"keep": 99}
 
 
 # -----------------------------------------------------------------------------
@@ -679,123 +711,6 @@ def test_v2_align_ctx_binds_request_slot_tables_for_state_copies():
     assert ctx.aligned_index_block_table_ptrs.tolist() == [
         block_tables.input_block_tables[0].data_ptr()
     ]
-
-
-# -----------------------------------------------------------------------------
-# stage_postprocess_inputs_to_gpu: single-pass staging into pinned views
-# -----------------------------------------------------------------------------
-
-
-def _make_staging_ctx(max_num_reqs: int, device: torch.device) -> MagicMock:
-    """Build a MambaSpecDecodeGPUContext stand-in exposing only the four
-    per-request staging buffers touched by stage_postprocess_inputs_to_gpu."""
-    ctx = MagicMock()
-    ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
-    ctx.num_scheduled_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
-    ctx.num_computed_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
-    ctx.num_draft_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
-    return ctx
-
-
-def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
-    """stage_postprocess_inputs_to_gpu writes each request's state_idx and
-    scheduled/computed/draft counts into slot `i` for `req_ids[i]`, leaves
-    slots past `num_reqs` untouched, and mirrors the values to the GPU buffers."""
-    device = torch.device("cpu")
-    max_num_reqs = 8
-    ctx = _make_staging_ctx(max_num_reqs, device)
-
-    # Any negative int32 works as a sentinel: all staged values (state_idx,
-    # scheduled/computed/draft token counts) are non-negative, so a negative
-    # entry surviving in slots [num_reqs:] proves the loop didn't overrun.
-    sentinel = np.int32(-1)
-    bufs = (
-        ctx.mamba_state_idx_buf,
-        ctx.num_scheduled_tokens_buf,
-        ctx.num_computed_tokens_buf,
-        ctx.num_draft_tokens_buf,
-    )
-    for buf in bufs:
-        buf.np[:] = sentinel
-
-    req_ids = ["req_a", "req_b", "req_c"]
-    num_reqs = len(req_ids)
-    scheduler_output = _make_postprocess_scheduler_output(
-        req_ids=req_ids,
-        num_scheduled_tokens={"req_a": 5, "req_b": 12, "req_c": 3},
-        # req_b intentionally absent -> defaults to 0 drafts.
-        scheduled_spec_decode_tokens={
-            "req_a": [1, 2],
-            "req_c": [1, 2, 3, 4],
-        },
-    )
-    requests = _make_requests(
-        req_ids=req_ids,
-        num_computed_tokens=[10, 20, 30],
-        block_ids_per_req=[[0], [0], [0]],
-    )
-    mamba_state_idx = {"req_a": 100, "req_b": 200, "req_c": 300}
-    # A trailing entry past num_reqs must not be read.
-    req_ids_padded = req_ids + ["not_scheduled"]
-
-    stage_postprocess_inputs_to_gpu(
-        ctx,
-        scheduler_output,
-        req_ids_padded,
-        num_reqs,
-        requests,
-        mamba_state_idx,
-    )
-
-    np.testing.assert_array_equal(
-        ctx.mamba_state_idx_buf.np[:num_reqs], [100, 200, 300]
-    )
-    np.testing.assert_array_equal(
-        ctx.num_scheduled_tokens_buf.np[:num_reqs], [5, 12, 3]
-    )
-    np.testing.assert_array_equal(
-        ctx.num_computed_tokens_buf.np[:num_reqs], [10, 20, 30]
-    )
-    np.testing.assert_array_equal(ctx.num_draft_tokens_buf.np[:num_reqs], [2, 0, 4])
-    for buf in bufs:
-        assert (buf.np[num_reqs:] == sentinel).all()
-
-    assert torch.equal(
-        ctx.mamba_state_idx_buf.gpu[:num_reqs],
-        torch.tensor([100, 200, 300], dtype=torch.int32),
-    )
-    assert torch.equal(
-        ctx.num_draft_tokens_buf.gpu[:num_reqs],
-        torch.tensor([2, 0, 4], dtype=torch.int32),
-    )
-
-
-def test_stage_postprocess_inputs_to_gpu_asserts_on_missing_state_idx():
-    """If preprocess_mamba didn't populate mamba_state_idx for a req in the
-    batch, staging must fail loudly rather than silently writing a stale index."""
-    device = torch.device("cpu")
-    ctx = _make_staging_ctx(max_num_reqs=4, device=device)
-    scheduler_output = _make_postprocess_scheduler_output(
-        req_ids=["req_a"],
-        num_scheduled_tokens={"req_a": 1},
-    )
-    requests = _make_requests(["req_a"], [0], [[0]])
-
-    # mamba_state_idx has an entry for a *different* request but not for
-    # req_a (the one being staged). This is the realistic failure mode:
-    # preprocess_mamba ran, populated some reqs, but missed this one.
-    # The safety assert in stage_postprocess_inputs_to_gpu must fire on
-    # req_a's missing entry rather than silently writing None.
-    mamba_state_idx: dict[str, int] = {"other_req": 42}
-    with pytest.raises(AssertionError, match="mamba_state_idx missing entry"):
-        stage_postprocess_inputs_to_gpu(
-            ctx,
-            scheduler_output,
-            ["req_a"],
-            1,
-            requests,
-            mamba_state_idx,
-        )
 
 
 def test_gpu_context_ignores_auxiliary_cache_tensors() -> None:
@@ -2336,7 +2251,7 @@ class TestPostprocessMambaFusedKernel:
         """Regression test for 240723d46: temporal copy_size must be
         inner_size * elem_size, not state_block_stride.
 
-        In production (gpu_model_runner.py), conv and temporal states share
+        In production (the model runner), conv and temporal states share
         a raw buffer via torch.as_strided where stride(0) equals
         page_size_bytes / elem_size — larger than either state's natural
         element count.  Using stride(0) as copy_size for temporal states
@@ -2371,7 +2286,7 @@ class TestPostprocessMambaFusedKernel:
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
 
-        # --- Production-like packed layout (mirrors gpu_model_runner.py) ---
+        # --- Production-like packed layout (mirrors the model runner) ---
         conv_shape = (cfg.conv_width, cfg.conv_inner_dim)
         temporal_shape = (cfg.temporal_state_dim,)
         dtype = cfg.dtype

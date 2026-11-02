@@ -20,11 +20,13 @@ from vllm.v1.worker.startup_plan import (
 )
 
 
-def test_v2_gpu_worker_requires_triton(monkeypatch):
+def test_gpu_worker_requires_triton(monkeypatch):
     monkeypatch.setattr(gpu_worker, "HAS_TRITON", False)
-    monkeypatch.setattr(gpu_worker.current_platform, "is_cpu", lambda: False)
-    config = SimpleNamespace(use_v2_model_runner=True)
-    with pytest.raises(ValueError, match="Model Runner V2 requires Triton"):
+    monkeypatch.setattr(
+        gpu_worker.current_platform, "uses_standalone_cpu_model_runner", lambda: False
+    )
+    config = SimpleNamespace()
+    with pytest.raises(ValueError, match="model runner requires Triton"):
         gpu_worker.Worker(
             config,
             local_rank=0,
@@ -455,7 +457,6 @@ def test_execute_model_waits_previous_pp_send_before_forward(
                 pipeline_parallel_size=2, distributed_executor_backend="mp"
             ),
         ),
-        use_v2_model_runner=True,
         model_runner=SimpleNamespace(execute_model=run_model, is_pooling_model=False),
         annotate_profile=lambda scheduler_output: nullcontext(),
         _pp_send_work=[previous_tensor_send],
@@ -528,7 +529,6 @@ def test_extensible_init_defers_the_connector(monkeypatch: pytest.MonkeyPatch):
         model_config=SimpleNamespace(enable_return_routed_experts=False),
         model_runner=runner,
         _maybe_get_memory_pool_context=lambda tag: nullcontext(),
-        _v2_model_runner=lambda: runner,
     )
     # Warmup commits what every rank can: another can commit two fewer.
     monkeypatch.setattr(gpu_worker, "_min_across_ranks", lambda value: value - 2)
