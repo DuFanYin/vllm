@@ -402,11 +402,8 @@ class AttentionGroup:
             * spec.page_size_bytes
             // (spec.num_states * row_bytes)
         )
-        # Token and pooled caches are written through manager-block slot
-        # mappings unless self-addressed, so only those and compressed caches
-        # (written from their block table) can be mapped.
         if (
-            (spec.tokens_per_state <= 1 and spec.uses_slot_mapping)
+            _is_slot_mapped_token_cache(spec)
             or kv_cache.shape[1] != 1
             or kv_cache.stride(0) % page_stride
         ):
@@ -475,15 +472,29 @@ def map_kv_caches_to_kernel_blocks(
     return mapped
 
 
+def _is_slot_mapped_token_cache(spec: KVCacheSpec) -> bool:
+    """Whether the cache is written per token (or pooled state) through
+    manager-block slot mappings, so its packed blocks cannot be split into
+    kernel blocks. Self-addressed and compressed caches can be."""
+    return spec.tokens_per_state <= 1 and spec.uses_slot_mapping
+
+
 def customize_attention_spec(
     backend: type[AttentionBackend], spec: AttentionSpec
 ) -> AttentionSpec:
     """The backend's spec. Blocks larger than every kernel block size a backend
-    takes are split into kernel blocks, which packed blocks must keep whole."""
+    takes are split into kernel blocks, which packed blocks must keep whole.
+    Slot-mapped token caches are left unaligned: packed, they cannot be split;
+    otherwise their pages already hold whole kernel blocks."""
     spec = backend.customize_spec(spec)
     sizes = backend.get_supported_kernel_block_sizes(spec)
     fixed_sizes = [s for s in sizes if isinstance(s, int)]
-    if spec.block_stride_alignment is None and sizes and fixed_sizes == sizes:
+    if (
+        spec.block_stride_alignment is None
+        and sizes
+        and fixed_sizes == sizes
+        and not _is_slot_mapped_token_cache(spec)
+    ):
         spec = replace(spec, block_stride_alignment=MultipleOf(max(fixed_sizes)))
     return spec
 
